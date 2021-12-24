@@ -366,15 +366,6 @@ def ring_topo_4(local_prob_list, worker_num=20):
 
         topology[worker_idx-3][worker_idx] = 1
         topology[worker_idx-6][worker_idx] = 1
-    
-    # for worker_idx in range(worker_num):
-    #     tmp_idx = 0
-    #     for neigh_idx in range(worker_idx, worker_num):
-    #         if topology[worker_idx][neigh_idx] == 1:
-    #             if local_prob_list[worker_idx][tmp_idx] < np.random.rand():
-    #                 topology[worker_idx][neigh_idx] = 0
-    #                 topology[neigh_idx][worker_idx] = 0
-    #             tmp_idx += 1
 
     ratios = np.ones(worker_num)
     return topology, ratios
@@ -552,17 +543,7 @@ def partition_data(dataset_type, data_pattern, worker_num=6):
 
     if data_pattern == 11:
         test_partition_sizes = np.ones((10, 6)) * (1 / 6)          
-        # partition_sizes = [ [0.33, 0.33, 0.34, 0.00, 0.00, 0.00], 
-        #                     [0.33, 0.33, 0.34, 0.00, 0.00, 0.00],
-        #                     [0.33, 0.34, 0.33, 0.00, 0.00, 0.00],
-        #                     [0.33, 0.34, 0.33, 0.00, 0.00, 0.00],
-        #                     [0.34, 0.33, 0.33, 0.00, 0.00, 0.00],
-        #                     [0.00, 0.00, 0.00, 0.34, 0.33, 0.33],
-        #                     [0.00, 0.00, 0.00, 0.34, 0.33, 0.33],
-        #                     [0.00, 0.00, 0.00, 0.33, 0.34, 0.33],
-        #                     [0.00, 0.00, 0.00, 0.33, 0.34, 0.33],
-        #                     [0.00, 0.00, 0.00, 0.33, 0.33, 0.34],
-        #                 ]
+        
         partition_sizes = [ [0.33, 0.00, 0.34, 0.00, 0.33, 0.00], 
                             [0.33, 0.00, 0.34, 0.00, 0.33, 0.00],
                             [0.33, 0.00, 0.34, 0.00, 0.33, 0.00],
