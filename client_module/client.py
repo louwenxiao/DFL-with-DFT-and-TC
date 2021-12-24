@@ -199,36 +199,7 @@ def aggregate_model(local_para, comm_neighbors, client_config, step_size, initia
                 model_para[para] = model_para[para] + p[para]
             model_para[para] = model_para[para] / (len(local_model_para)+1)
     return client_data,model_para, weight_cosine_similarity
-    
-    with torch.no_grad():
-        cos_delta_list = list()
-        para_delta = torch.zeros_like(local_para)
-        average_weight = 1.0 / (len(comm_neighbors) + 1)
-        weight_cosine_similarity = np.zeros((len(comm_neighbors), ))
-        for neighbor_idx, _ in comm_neighbors:
-            client_data.append(client_config.neighbor_paras[neighbor_idx])
-            print("idx: {}, weight: {}".format(neighbor_idx, average_weight))
-            indice = client_config.neighbor_indices[neighbor_idx]
-            selected_indicator = torch.zeros_like(local_para)
-            selected_indicator[indice] = 1.0
-            model_delta = (client_config.neighbor_paras[neighbor_idx] - local_para) * selected_indicator
-            para_delta += step_size * average_weight * model_delta
-            cos_delta = client_config.neighbor_paras[neighbor_idx] - initial_para
-            cos_delta_list.append(cos_delta.detach().clone().cpu().numpy())
 
-            client_config.estimated_consensus_distance[neighbor_idx] = np.power(np.power(torch.norm(model_delta).item(), 2) / len(indice) * model_delta.nelement(), 0.5)
-        local_para += para_delta
-
-        local_delta = local_para - initial_para
-        local_delta = local_delta.detach().clone().cpu().numpy()
-        for row_idx in range(len(comm_neighbors)):
-            num = cos_delta_list[row_idx].dot(local_delta)
-            denom = linalg.norm(cos_delta_list[row_idx]) * linalg.norm(local_delta)
-            weight_cosine_similarity[row_idx] = num / denom
-
-        print("cos: ", weight_cosine_similarity)
-    # return local_para, weight_cosine_similarity
-    return client_data,model_para, weight_cosine_similarity
 
 def compress_model(local_para, ratio):
     start_time = time.time()
@@ -248,18 +219,6 @@ def get_compressed_model(config, name, nelement):
     received_para = get_data_socket(config.get_socket_dict[name])
     config.neighbor_paras[name] = received_para
     
-    # received_para, select_n, rd_seed = get_data_socket(config.get_socket_dict[name])
-    # received_para.to(device)
-    # print("get time: ", time.time() - start_time)
-
-    # restored_model = torch.zeros(nelement).to(device)
-    
-    # rng = np.random.RandomState(rd_seed)
-    # indices = rng.choice(nelement, size=select_n, replace=False)
-    # restored_model[indices] = received_para
-
-    # config.neighbor_paras[name] = restored_model.data
-    # config.neighbor_indices[name] = indices
 
 def compress_model_top(local_para, ratio):
     start_time = time.time()
