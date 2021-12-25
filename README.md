@@ -30,3 +30,15 @@ communication_module文件夹：主要用于client之间的通信，在我们的
 client_module文件夹：关于client的各种设置，主要函数为client.py，如训练过程整体描述。
 
 
+## 参数设置
+实验设置
+
+| dataset/model         | test_acc | lr/min_lr | decay_rate | local_iteration | epoch | momentum | weight_decay |
+| --------------------- | -------- | --------- | ---------- | --------------- | ----- | -------- | ------------ |
+| CIFAR10/AlextNet      | 0.8      | 0.1/0.001 | 0.99       | 50              | 500   | -1       | 0.00         |
+| CIFAR10/VGG9          | 0.85     | 0.1/0.001 | 0.99       | 50              | 500   | -1       | 0.00         |
+| EMNIST/CNN            |          |           |            |                 |       |          |              |
+| CIFAR100/ResNet9      |          |           |            |                 |       |          |              |
+| tinyImageNet/ResNet50 |          |           |            |                 |       |          |              |
+
+
