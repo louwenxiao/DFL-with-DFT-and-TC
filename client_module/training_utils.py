@@ -45,9 +45,11 @@ def train(model, data_loader, optimizer, local_iters=None, device=torch.device("
             if len(tensor_data) == 0:tensor_data.append((x_data, output, target))
             elif random.random() < 0.5:tensor_data.append((x_data, output, target))
     
+    key = ['features.0.weight', 'features.0.bias', 'features.3.weight', 'features.3.bias', 'features.6.weight', 
+           'features.6.bias', 'features.8.weight', 'features.8.bias', 'features.10.weight', 'features.10.bias']
     model_dict = dict()
     for para in model.state_dict().keys():
-        if para in ['conv_layer.0.weight', 'conv_layer.0.bias', 'conv_layer.2.weight', 'conv_layer.2.bias']:
+        if para in key:
             model_dict[para] = copy.deepcopy(model.state_dict()[para])
 
     if samples_num != 0:
@@ -100,6 +102,8 @@ def train_neighbor_data(model, data_loader, optimizer, device=torch.device("cpu"
     #     for x_data, logit, label in data:
         
             x_data, logit, label = x_data.to(device), logit.to(device), label.to(device)
+            # print(x_data)
+            # print(label)
             
             _,output = model(x_data)
 
@@ -137,6 +141,5 @@ class KL_Loss(nn.Module):
         loss = self.T * self.T * nn.KLDivLoss(reduction='batchmean')(output_batch, teacher_outputs)
 
         return loss
-
 
 
