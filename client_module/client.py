@@ -43,6 +43,7 @@ args = parser.parse_args()
 
 
 if args.visible_cuda == '-1':
+    # os.environ['CUDA_VISIBLE_DEVICES'] = str(((int(args.idx) % 3)+1) % 2)
     os.environ['CUDA_VISIBLE_DEVICES'] = str((int(args.idx) +2)% 4)
 else:
     os.environ['CUDA_VISIBLE_DEVICES'] = args.visible_cuda
@@ -64,6 +65,8 @@ def main():
 
     for arg in vars(args):
         print(arg, ":", getattr(args, arg))
+
+    # create model
 
     local_model = models_client.create_model_instance(args.dataset_type, args.model_type)
     initial_para = client_config.para.clone().to(device)
@@ -98,6 +101,7 @@ def main():
     loop.close()
 
     epoch_lr = args.lr
+    diatance = []
     for epoch in range(1, 1+args.epoch):
         epoch_steps = 0
         epoch_train_loss = 0.0
@@ -108,7 +112,8 @@ def main():
         print("epoch-{} lr: {}".format(epoch, epoch_lr))
 
         local_steps, comm_neighbors, compre_ratio =  get_data_socket(master_socket)
-        num_data = 5
+        num_data = 4
+        data_fe = []
 
         # 本地训练，提取特征，提取分类器参数
         while local_steps > 0:
@@ -121,6 +126,7 @@ def main():
             tensor_data,train_loss,model_dict = train(local_model, train_loader, optimizer, local_iters=local_steps, 
                                            device=device, model_type=args.model_type,num_data=num_data)
             print("train_lossL: ",train_loss)
+            data_fe.append(tensor_data[0][2])
             print("train time: ", time.time() - start_time)
             epoch_train_loss += (train_loss * local_steps)
             start_time = time.time()
@@ -147,20 +153,24 @@ def main():
 
                 # aggregate parameters
                 local_data,local_para, local_cos = aggregate_model(local_model_dict, comm_neighbors, client_config, args.step_size, initial_para)
-            
+                for d in local_data:
+                    data_fe.append(d[0][2])
             # torch.nn.utils.vector_to_parameters(local_para, local_model.parameters())
-            local_model.load_state_dict(local_para)
-            train_loss = train_neighbor_data(local_model, local_data, optimizer, device=device)
-
+                local_model.load_state_dict(local_para)
+                train_loss = train_neighbor_data(local_model, local_data, optimizer, device=device)
+            else:
+                train_loss,local_cos = 0,0.9
+                
             neighbors_consensus_distance = dict()
             for neighbor_idx, _ in comm_neighbors:
                 neighbors_consensus_distance[neighbor_idx] = client_config.estimated_consensus_distance[neighbor_idx]
             send_data_socket((train_loss, neighbors_consensus_distance, local_update_norm, local_cos), master_socket)
             local_steps, comm_neighbors, compre_ratio =  get_data_socket(master_socket)
             print("***")
+        
         start_time = time.time()
         test_loss, acc = test(local_model, test_loader, device, model_type=args.model_type)
-        
+ 
         send_data_socket((epoch, time.time() - epoch_start_time, acc, test_loss, epoch_train_loss/epoch_steps), master_socket)
         print("test time: ", time.time() - start_time)
         recorder.add_scalar('acc_worker-' + str(args.idx), acc, epoch)
@@ -192,14 +202,46 @@ def aggregate_model(local_para, comm_neighbors, client_config, step_size, initia
             client_config.estimated_consensus_distance[neighbor_idx] = 0.9
     model_para = copy.deepcopy(local_para)
     for para in local_para.keys():
-        if para not in ['conv_layer.0.weight', 'conv_layer.0.bias', 'conv_layer.2.weight', 'conv_layer.2.bias']:
+        key = ['conv_layer.0.weight', 'conv_layer.0.bias', 'conv_layer.2.weight', 'conv_layer.2.bias']
+        key = ['features.0.weight', 'features.0.bias', 'features.3.weight', 'features.3.bias', 'features.6.weight', 
+           'features.6.bias', 'features.8.weight', 'features.8.bias', 'features.10.weight', 'features.10.bias']
+        if para not in key:
             continue
         else:
             for p in local_model_para:
                 model_para[para] = model_para[para] + p[para]
             model_para[para] = model_para[para] / (len(local_model_para)+1)
     return client_data,model_para, weight_cosine_similarity
+    
+    with torch.no_grad():
+        cos_delta_list = list()
+        para_delta = torch.zeros_like(local_para)
+        average_weight = 1.0 / (len(comm_neighbors) + 1)
+        weight_cosine_similarity = np.zeros((len(comm_neighbors), ))
+        for neighbor_idx, _ in comm_neighbors:
+            client_data.append(client_config.neighbor_paras[neighbor_idx])
+            print("idx: {}, weight: {}".format(neighbor_idx, average_weight))
+            indice = client_config.neighbor_indices[neighbor_idx]
+            selected_indicator = torch.zeros_like(local_para)
+            selected_indicator[indice] = 1.0
+            model_delta = (client_config.neighbor_paras[neighbor_idx] - local_para) * selected_indicator
+            para_delta += step_size * average_weight * model_delta
+            cos_delta = client_config.neighbor_paras[neighbor_idx] - initial_para
+            cos_delta_list.append(cos_delta.detach().clone().cpu().numpy())
 
+            client_config.estimated_consensus_distance[neighbor_idx] = np.power(np.power(torch.norm(model_delta).item(), 2) / len(indice) * model_delta.nelement(), 0.5)
+        local_para += para_delta
+
+        local_delta = local_para - initial_para
+        local_delta = local_delta.detach().clone().cpu().numpy()
+        for row_idx in range(len(comm_neighbors)):
+            num = cos_delta_list[row_idx].dot(local_delta)
+            denom = linalg.norm(cos_delta_list[row_idx]) * linalg.norm(local_delta)
+            weight_cosine_similarity[row_idx] = num / denom
+
+        print("cos: ", weight_cosine_similarity)
+    # return local_para, weight_cosine_similarity
+    return client_data,model_para, weight_cosine_similarity
 
 def compress_model(local_para, ratio):
     start_time = time.time()
@@ -217,9 +259,12 @@ def compress_model(local_para, ratio):
 def get_compressed_model(config, name, nelement):
     start_time = time.time()
     received_para = get_data_socket(config.get_socket_dict[name])
+    # print("get time:",time.time()-start_time)
     config.neighbor_paras[name] = received_para
     
+    print("get time: ", time.time() - start_time)
 
+    
 def compress_model_top(local_para, ratio):
     start_time = time.time()
     with torch.no_grad():
@@ -231,18 +276,6 @@ def compress_model_top(local_para, ratio):
 
     return (select_para, indices)
 
-def get_compressed_model_top(config, name, nelement):
-    start_time = time.time()
-    received_para, indices = get_data_socket(config.get_socket_dict[name])
-    received_para.to(device)
-    print("get time: ", time.time() - start_time)
-
-    restored_model = torch.zeros(nelement).to(device)
-    
-    restored_model[indices] = received_para
-
-    config.neighbor_paras[name] = restored_model.data
-    config.neighbor_indices[name] = indices
 
 if __name__ == '__main__':
     main()
