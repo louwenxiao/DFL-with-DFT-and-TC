@@ -21,9 +21,9 @@ from training_module import datasets, models_client, utils
 from control_algorithm import *
 
 parser = argparse.ArgumentParser(description='Distributed Client')
-parser.add_argument('--model_type', type=str, default='VGG')
+parser.add_argument('--model_type', type=str, default='A')
 parser.add_argument('--dataset_type', type=str, default='CIFAR10')
-parser.add_argument('--batch_size', type=int, default=64)
+parser.add_argument('--batch_size', type=int, default=32)
 parser.add_argument('--data_pattern', type=int, default=11)
 parser.add_argument('--weight_decay', type=float, default=5e-4)
 parser.add_argument('--alpha', type=float, default=200)
@@ -34,8 +34,8 @@ parser.add_argument('--prob', type=float, default=1.0)
 parser.add_argument('--lr', type=float, default=0.01)
 parser.add_argument('--step_size', type=float, default=1.0)
 parser.add_argument('--decay_rate', type=float, default=0.98)
-parser.add_argument('--epoch', type=int, default=200)
-parser.add_argument('--local_updates', type=int, default=40)
+parser.add_argument('--epoch', type=int, default=200)            # 注意，这里修改了
+parser.add_argument('--local_updates', type=int, default=30)
 
 args = parser.parse_args()
 
@@ -113,6 +113,7 @@ def main():
                 common_config.worker_list[worker_idx].config.custom["neighbor_info"][neighbor_idx] = \
                         (neighbor_ip, p2p_port[worker_idx][neighbor_idx], p2p_port[neighbor_idx][worker_idx], neighbor_bandwidth)
 
+
     feature_extraction = models_client.create_model_instance(common_config.dataset_type, common_config.model_type)
     
     init_para = torch.nn.utils.parameters_to_vector(feature_extraction.parameters())
@@ -121,7 +122,8 @@ def main():
     
     # partition dataset
     train_data_partition, test_data_partition = partition_data(common_config.dataset_type, args.data_pattern)
-
+    # sys.exit()
+    
     for worker_idx, worker in enumerate(common_config.worker_list):
         worker.config.para = init_para
         worker.config.custom["train_data_idxes"] = train_data_partition.use(worker_idx)
@@ -145,12 +147,12 @@ def main():
     total_round = 0
     distance_factor = args.alpha
     bandwidth = np.zeros((2, 10))
-    # bandwidth[0] = np.random.rand(10) * 2.375 + 0.125 # 0.125MB/s ~ 2.5MB/s(1Mb/s ~ 20Mb/s)
-    # bandwidth[0] = np.array([1, 3, 5, 7, 9, 11, 13, 15, 17, 19]) / 8
-    bandwidth[0] = np.array([10, 10, 10, 10, 10, 10, 10, 10, 10, 10]) / 8
+    bandwidth[0] = np.random.rand(10) * 2.375 + 0.125 # 0.125MB/s ~ 2.5MB/s(1Mb/s ~ 20Mb/s)
     bandwidth[1] = bandwidth[0].copy() / 2.0
     server_cos_prob = np.ones((worker_num, 4))
     for epoch_num in range(1, 1+common_config.epoch):
+        if epoch_num%20==2:
+            print(train_data_partition)
         # distance_factor = distance_factor * 0.99
         if distance_factor > 50:
             distance_factor = distance_factor * 0.99
@@ -164,9 +166,29 @@ def main():
             bandwidth_delta = np.random.rand(10) *4 - 2
             bandwidth[0] = np.clip(bandwidth[0] + bandwidth_delta, 0.125, 2.5)
             bandwidth[1] = bandwidth[0].copy() / 2.0
-            
+
             topology, ratios = ring_topo(server_cos_prob)
-           
+
+            topology = [[0,1,0,0,0,1],
+                        [1,0,1,0,0,0],
+                        [0,1,0,1,0,0],
+                        [0,0,1,0,1,0],
+                        [0,0,0,1,0,1],
+                        [1,0,0,0,1,0]]
+
+            for i in range(6):
+                for j in range(i,6):
+                    if random.random() < topology[i][j]:
+                        topology[i][j] = 1
+                        topology[j][i] = 1
+                    else:
+                        topology[i][j] = 0
+                        topology[j][i] = 0
+            
+
+            # print("bandwidth ", bandwidth)
+            print("topo\n", topology)    # 这个之前会输出......
+            
             total_transfer_size = 0
             for worker in common_config.worker_list:
                 worker_data_size = np.sum(topology[worker.idx]) * ratios[worker.idx] * model_size
@@ -190,9 +212,6 @@ def main():
             if curr_steps > test_steps:
                 curr_steps = curr_steps % test_steps
                 break
-        
-        # common_config.recoder.add_scalar('Simulated Epoch time', simulated_epoch_time, epoch_num)
-
 
         # start_time = time.time()
         # testing signal
@@ -312,7 +331,6 @@ class TrainingRecorder(object):
         self.recorder.add_scalar('Accuracy/round_average', avg_acc, self.round)
         self.recorder.add_scalar('Test_loss/round_average', avg_test_loss, self.round)
         print("Epoch: {}, time: {}, average accuracy: {}, average test loss: {}, average train loss: {}".format(self.epoch, self.total_time, avg_acc, avg_test_loss, train_loss))
-
 
 
 def get_topology_rates(mode, topology, consensus_distance, bandwidth, target_distance,  comp_time, model_size, prob):
@@ -538,12 +556,12 @@ def non_iid_partition(ratio, worker_num=20):
     return partition_sizes
 
 
-def partition_data(dataset_type, data_pattern, worker_num=6):      
+def partition_data(dataset_type, data_pattern, worker_num=6):      # 使用6个用户训练，需要添加一个IID
     train_dataset, test_dataset = datasets.load_datasets(dataset_type)
 
     if data_pattern == 11:
-        test_partition_sizes = np.ones((10, 6)) * (1 / 6)          
-        
+        test_partition_sizes = np.ones((10, 6)) * (1 / 6)           # 划分成2个类，每个用户具有一半的标签
+       
         partition_sizes = [ [0.33, 0.00, 0.34, 0.00, 0.33, 0.00], 
                             [0.33, 0.00, 0.34, 0.00, 0.33, 0.00],
                             [0.33, 0.00, 0.34, 0.00, 0.33, 0.00],
@@ -557,34 +575,36 @@ def partition_data(dataset_type, data_pattern, worker_num=6):
                         ]
         partition_sizes = np.array(partition_sizes)
     elif data_pattern == 12:
-        test_partition_sizes = np.ones((10, 6)) * (1 / 6)           
-        partition_sizes = [ [0.3, 0.3, 0.3, 0.03, 0.03, 0.04], 
-                            [0.3, 0.3, 0.3, 0.03, 0.03, 0.04], 
-                            [0.3, 0.3, 0.3, 0.03, 0.03, 0.04], 
-                            [0.3, 0.3, 0.3, 0.03, 0.03, 0.04], 
-                            [0.3, 0.3, 0.3, 0.03, 0.03, 0.04], 
-                            [0.03, 0.03, 0.04, 0.3, 0.3, 0.3],
-                            [0.03, 0.03, 0.04, 0.3, 0.3, 0.3],
-                            [0.03, 0.03, 0.04, 0.3, 0.3, 0.3],
-                            [0.03, 0.03, 0.04, 0.3, 0.3, 0.3],
-                            [0.03, 0.03, 0.04, 0.3, 0.3, 0.3],
+        test_partition_sizes = np.ones((10, 6)) * (1 / 6)           # 划分成2个类，每个用户具有一半的标签
+        
+        partition_sizes = [ [0.25, 0.08, 0.25, 0.08, 0.25, 0.09], 
+                           [0.25, 0.08, 0.25, 0.08, 0.25, 0.09],
+                           [0.25, 0.08, 0.25, 0.08, 0.25, 0.09],
+                           [0.25, 0.08, 0.25, 0.08, 0.25, 0.09],
+                           [0.25, 0.08, 0.25, 0.08, 0.25, 0.09],
+                            [0.08, 0.25, 0.08, 0.25, 0.09, 0.25],
+                            [0.08, 0.25, 0.08, 0.25, 0.09, 0.25],
+                            [0.08, 0.25, 0.08, 0.25, 0.09, 0.25],
+                            [0.08, 0.25, 0.08, 0.25, 0.09, 0.25],
+                            [0.08, 0.25, 0.08, 0.25, 0.09, 0.25]
                         ]
     elif data_pattern == 13:
-        test_partition_sizes = np.ones((10, 6)) * (1 / 6)          
-        partition_sizes = [ [0.5, 0.5, 0.0, 0.00, 0.00, 0.00], 
-                            [0.5, 0.5, 0.0, 0.00, 0.00, 0.00],
-                            [0.5, 0.5, 0.0, 0.00, 0.00, 0.00],
-                            [0.0, 0.0, 0.5, 0.50, 0.00, 0.00],
-                            [0.0, 0.0, 0.5, 0.50, 0.00, 0.00],
-                            [0.0, 0.0, 0.5, 0.50, 0.00, 0.00],
-                            [0.0, 0.0, 0.0, 0.00, 0.50, 0.50],
-                            [0.0, 0.0, 0.0, 0.00, 0.50, 0.50],
-                            [0.0, 0.0, 0.0, 0.00, 0.50, 0.50],
-                            [0.0, 0.0, 0.0, 0.00, 0.50, 0.50],
+        test_partition_sizes = np.ones((10, 6)) * (1 / 6)           # 划分成三个类，每一个类只有3或4个标签
+        
+        partition_sizes = [ [0.40, 0.05, 0.05, 0.40, 0.05, 0.05],
+                            [0.40, 0.05, 0.05, 0.40, 0.05, 0.05],
+                            [0.40, 0.05, 0.05, 0.40, 0.05, 0.05],
+                            [0.05, 0.40, 0.05, 0.05, 0.40, 0.05],
+                            [0.05, 0.40, 0.05, 0.05, 0.40, 0.05],
+                            [0.05, 0.40, 0.05, 0.05, 0.40, 0.05],
+                            [0.05, 0.05, 0.40, 0.05, 0.05, 0.40],
+                            [0.05, 0.05, 0.40, 0.05, 0.05, 0.40],
+                            [0.05, 0.05, 0.40, 0.05, 0.05, 0.40],
+                            [0.05, 0.05, 0.40, 0.05, 0.05, 0.40]
                         ]
         partition_sizes = np.array(partition_sizes)
     elif data_pattern == 14:
-        test_partition_sizes = np.ones((10, 6)) * (1 / 6)          
+        test_partition_sizes = np.ones((10, 6)) * (1 / 6)           # 划分成三个类，只不过每一个类包含全部标签
         partition_sizes = [ [0.250, 0.250, 0.125, 0.125, 0.125, 0.125],
                             [0.250, 0.250, 0.125, 0.125, 0.125, 0.125],
                             [0.250, 0.250, 0.125, 0.125, 0.125, 0.125],
@@ -598,7 +618,7 @@ def partition_data(dataset_type, data_pattern, worker_num=6):
                         ]
         partition_sizes = np.array(partition_sizes)
     elif data_pattern == 15:
-        test_partition_sizes = np.ones((10, 6)) * (1 / 6)           
+        test_partition_sizes = np.ones((10, 6)) * (1 / 6)           # 划分成三个类，只不过每一个类包含全部标签
         partition_sizes = [ [0.40, 0.40, 0.05, 0.05, 0.05, 0.05],
                             [0.40, 0.40, 0.05, 0.05, 0.05, 0.05],
                             [0.40, 0.40, 0.05, 0.05, 0.05, 0.05],
@@ -610,23 +630,39 @@ def partition_data(dataset_type, data_pattern, worker_num=6):
                             [0.05, 0.05, 0.05, 0.05, 0.40, 0.40],
                             [0.05, 0.05, 0.05, 0.05, 0.40, 0.40]
                         ]
+        partition_sizes = [ [0.40, 0.05, 0.05, 0.40, 0.05, 0.05],
+                            [0.40, 0.05, 0.05, 0.40, 0.05, 0.05],
+                            [0.40, 0.05, 0.05, 0.40, 0.05, 0.05],
+                            [0.05, 0.40, 0.05, 0.05, 0.40, 0.05],
+                            [0.05, 0.40, 0.05, 0.05, 0.40, 0.05],
+                            [0.05, 0.40, 0.05, 0.05, 0.40, 0.05],
+                            [0.05, 0.05, 0.40, 0.05, 0.05, 0.40],
+                            [0.05, 0.05, 0.40, 0.05, 0.05, 0.40],
+                            [0.05, 0.05, 0.40, 0.05, 0.05, 0.40],
+                            [0.05, 0.05, 0.40, 0.05, 0.05, 0.40]
+                        ]
         partition_sizes = np.array(partition_sizes)
-    else:                                                              
+    
+    elif data_pattern == 16:
+        test_partition_sizes = np.ones((10, 6)) * (1 / 6)   
+        def non_iid_partition_cifar10(ratio, worker_num=6):
+            partition_sizes = np.ones((10, worker_num)) * ((1 - ratio) / (worker_num-1))
+
+            for worker_idx in range(worker_num):
+                partition_sizes[worker_idx][worker_idx] = ratio
+            
+            partition_sizes[-1] = np.ones(worker_num) * (1 / worker_num)
+
+            return partition_sizes
+        partition_sizes = non_iid_partition_cifar10(0.4,6)
+        # print(partition_sizes)
+    else:                                                               # IID 分布
         test_partition_sizes = np.ones((10, 6)) * (1 / 6)  
         partition_sizes = np.ones((10, 6)) * (1 / 6)  
-
-    # if dataset_type == "CIFAR100":
-    #     test_partition_sizes = np.ones((100, worker_num)) * (1 / worker_num)
-    #     partition_sizes = np.ones((100, worker_num)) * (1 / worker_num)
-    # elif dataset_type == "CIFAR10":
-    #     test_partition_sizes = np.ones((10, worker_num)) * (1 / worker_num)
-    #     if data_pattern == 0:
-    #         partition_sizes = np.ones((10, worker_num)) * (1.0 / worker_num)
-    #     else:
-    #         partition_sizes = non_iid_partition(data_pattern*0.1,worker_num=worker_num)
-
+    print(partition_sizes)
+    
     train_data_partition = datasets.LabelwisePartitioner(train_dataset, partition_sizes=partition_sizes)
-    # test_data_partition = datasets.LabelwisePartitioner(test_dataset, partition_sizes=partition_sizes)            
+    # test_data_partition = datasets.LabelwisePartitioner(test_dataset, partition_sizes=partition_sizes)           
     test_data_partition = datasets.LabelwisePartitioner(test_dataset, partition_sizes=test_partition_sizes)     
     
     return train_data_partition, test_data_partition
