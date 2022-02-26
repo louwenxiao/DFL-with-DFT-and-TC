@@ -26,7 +26,7 @@ Latest commit 06b345e in 26 seconds
  History
  1 contributor
 102 lines (85 sloc)  3.35 KB
-   
+
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
@@ -74,6 +74,8 @@ class AlexNet(nn.Module):
     
 def create_model_instance(dataset_type, model_type):
     return AlexNet()
+
+
 
 
 © 2021 GitHub, Inc.
