@@ -8,12 +8,15 @@ import asyncio
 import concurrent.futures
 import json
 import random
+import math
 import copy
-import setproctitle
+import datetime
+# import setproctitle
 
 import numpy as np
 from numpy import linalg
 import torch
+import pandas as pd
 
 from config import *
 from communication_module.comm_utils import *
@@ -31,18 +34,22 @@ parser.add_argument('--algorithm', type=str, default='proposed')
 parser.add_argument('--mode', type=str, default='adaptive')
 parser.add_argument('--topology', type=str, default='ring')
 parser.add_argument('--prob', type=float, default=1.0)
-parser.add_argument('--lr', type=float, default=0.01)
+parser.add_argument('--lr', type=float, default=0.02)
 parser.add_argument('--step_size', type=float, default=1.0)
 parser.add_argument('--decay_rate', type=float, default=0.98)
-parser.add_argument('--epoch', type=int, default=200)            # 注意，这里修改了
+parser.add_argument('--epoch', type=int, default=1200)            # 注意，这里修改了
 parser.add_argument('--local_updates', type=int, default=30)
+parser.add_argument('--num_data', type=int, default=8)
+parser.add_argument('--xigema', type=int, default=0)
 
 args = parser.parse_args()
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
-pid_name = "FedGKT"
-setproctitle.setproctitle(pid_name)
+# os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+# pid_name = "FedGKT"
+# setproctitle.setproctitle(pid_name)
 SERVER_IP = "127.0.0.1"
+RESULT = [[0],[0],[0],[4]]      # 分别用来保存：带宽MB，时间s，精度，损失
+model_size = 0.1 + 2.0 * args.num_data
 
 def main():
     result = []
@@ -64,15 +71,24 @@ def main():
         workers_config = json.load(json_file)
 
     # init p2p topology
-    workers_config['worker_config_list'] = workers_config['worker_config_list'][:6]
+    
+    workers_config['worker_config_list'] = workers_config['worker_config_list'][:16]
     worker_num = len(workers_config['worker_config_list'])
-    adjacency_matrix = np.ones((worker_num, worker_num), dtype=np.int)
+    adjacency_matrix = get_topology(worker_num)
+    
+    topology_prob = get_topology(worker_num)
+    topology_prob = np.array(topology_prob)*1.0
+    topology = get_topology(worker_num)
+    train_num_topo = get_topology(worker_num)
+    for topo in topology_prob:
+        print(topo)
+    # 设置为全连接的拓扑
 
     for worker_idx in range(worker_num):
         adjacency_matrix[worker_idx][worker_idx] = 0
 
     p2p_port = np.zeros_like(adjacency_matrix)
-    curr_port = common_config.p2p_listen_port_base + random.randint(0, 20) * 200
+    curr_port = common_config.p2p_listen_port_base + random.randint(10, 20) * 192
     for idx_row in range(len(adjacency_matrix)):
         for idx_col in range(len(adjacency_matrix[0])):
             if adjacency_matrix[idx_row][idx_col] != 0:
@@ -115,109 +131,90 @@ def main():
 
 
     feature_extraction = models_client.create_model_instance(common_config.dataset_type, common_config.model_type)
-    
-    init_para = torch.nn.utils.parameters_to_vector(feature_extraction.parameters())
-    model_size = init_para.nelement() * 4 / 1024 / 1024
+    torch.save(feature_extraction.state_dict(),"/data/wxlou/nonIID/My/fedgkt_cifar10/save_model/model.pt")
+    model_size = 0.5 + 1.5*args.num_data
     print("Model Size: {} MB".format(model_size))
     
     # partition dataset
-    train_data_partition, test_data_partition = partition_data(common_config.dataset_type, args.data_pattern)
-    # sys.exit()
-    
+    train_data_partition, test_data_partition = partition_data(common_config.dataset_type, args.data_pattern,worker_num=worker_num)
+    if worker_num == 16:
+        data_para = [0, 6, 10, 12, 1, 7, 11, 13, 2, 4, 8, 14, 3, 5, 9, 15]
+    elif worker_num == 12:
+        data_para = [0, 6, 8, 1, 7, 9, 2, 4, 10, 3, 5, 11]
+    elif worker_num == 9:
+        data_para = [0, 4, 8, 1, 5, 6, 2, 3, 7]
+    else:
+        data_para = [0,1,2,3]
+        
     for worker_idx, worker in enumerate(common_config.worker_list):
-        worker.config.para = init_para
-        worker.config.custom["train_data_idxes"] = train_data_partition.use(worker_idx)
-        worker.config.custom["test_data_idxes"] = test_data_partition.use(worker_idx)
+        worker.config.para = None
+        p = data_para.index(worker_idx)
+        worker.config.custom["train_data_idxes"] = train_data_partition.use(p)
+        worker.config.custom["test_data_idxes"] = test_data_partition.use(p)
 
     # connect socket and send init config
     communication_parallel(common_config.worker_list, action="init")
 
-    curr_steps = 0    
-    test_steps = int(len(train_data_partition) / common_config.batch_size)
-    
     training_recorder = TrainingRecorder(common_config.worker_list, common_config.recoder)
-    consensus_distance = np.ones((worker_num, worker_num)) * 1e-6
 
     if args.local_updates > 0:
         local_steps = args.local_updates
     else:
         local_steps = int(np.ceil(50000 / worker_num / 64.0))
     print("local steps: {}".format(local_steps))
-    avg_update_norm = 4.0
-    total_round = 0
-    distance_factor = args.alpha
-    bandwidth = np.zeros((2, 10))
-    bandwidth[0] = np.random.rand(10) * 2.375 + 0.125 # 0.125MB/s ~ 2.5MB/s(1Mb/s ~ 20Mb/s)
-    bandwidth[1] = bandwidth[0].copy() / 2.0
-    server_cos_prob = np.ones((worker_num, 4))
+    
+    # bandwidth = np.zeros((2, 10))
+    # bandwidth[0] = np.random.rand(10) * 2.375 + 0.125 # 0.125MB/s ~ 2.5MB/s(1Mb/s ~ 20Mb/s)
+    # bandwidth[0] = np.array([1, 3, 5, 7, 9, 11, 13, 15, 17, 19]) / 8
+    # bandwidth[0] = np.array([1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000]) / 8
+    # bandwidth[1] = bandwidth[0].copy() / 2.0
+    start_time = datetime.datetime.now().strftime("%m-%d_%H-%M")
     for epoch_num in range(1, 1+common_config.epoch):
-        if epoch_num%20==2:
-            print(train_data_partition)
-        # distance_factor = distance_factor * 0.99
-        if distance_factor > 50:
-            distance_factor = distance_factor * 0.99
-        else:
-            distance_factor = 50
         print("\n--**--\nEpoch: {}".format(epoch_num))
-        # simulated_epoch_time = 0
-        while True:
-            total_round += 1
-            
-            bandwidth_delta = np.random.rand(10) *4 - 2
-            bandwidth[0] = np.clip(bandwidth[0] + bandwidth_delta, 0.125, 2.5)
-            bandwidth[1] = bandwidth[0].copy() / 2.0
+        time1 = time.time()
+        
+        for i in range(len(topology_prob[0])):
+            for j in range(i,len(topology_prob[0])):
+                if random.random() < topology_prob[i][j]:
+                    topology[i][j] = 1
+                    topology[j][i] = 1
+                else:
+                    topology[i][j] = 0
+                    topology[j][i] = 0
+        # topology = get_connected_graph(topology,topology_prob)
+        for topo in topology:
+            print(topo)
+        
+        total_transfer_size = 0
+        for worker in common_config.worker_list:
+            worker_data_size = np.sum(topology[worker.idx]) * model_size
+            common_config.recoder.add_scalar('Data Size-'+str(worker.idx), worker_data_size, epoch_num)
+            total_transfer_size += worker_data_size
+            neighbors_list = list()
+            for neighbor_idx, link in enumerate(topology[worker.idx]):
+                if link == 1:
+                    neighbors_list.append((neighbor_idx, 1.0 / (np.max([np.sum(topology[worker.idx]), np.sum(topology[neighbor_idx])])+1)))
+            send_data_socket((local_steps, neighbors_list,args.num_data), worker.socket)
 
-            topology, ratios = ring_topo(server_cos_prob)
+        common_config.recoder.add_scalar('Data Size', total_transfer_size, epoch_num)
+        common_config.recoder.add_scalar('Num of Links', np.sum(topology), epoch_num)
+        common_config.recoder.add_scalar('Avg Rate', np.average(1.0), epoch_num)
+        test_loss, cos_dis_vector, test_acc = training_recorder.get_train_info()
+        
+        print("Epoch: {}, average accuracy: {}, average test loss: {}".format(
+            epoch_num, test_acc, test_loss))
+        time2 = time.time()
 
-            topology = [[0,1,0,0,0,1],
-                        [1,0,1,0,0,0],
-                        [0,1,0,1,0,0],
-                        [0,0,1,0,1,0],
-                        [0,0,0,1,0,1],
-                        [1,0,0,0,1,0]]
+        # topology_prob,train_num_topo = update_topo(topology_prob,train_num_topo,cos_dis_vector)
+        
+        RESULT[0].append(RESULT[0][epoch_num-1]+total_transfer_size)
+        RESULT[1].append(RESULT[1][epoch_num-1]+0)
+        RESULT[2].append(test_acc)
+        RESULT[3].append(test_loss)
 
-            for i in range(6):
-                for j in range(i,6):
-                    if random.random() < topology[i][j]:
-                        topology[i][j] = 1
-                        topology[j][i] = 1
-                    else:
-                        topology[i][j] = 0
-                        topology[j][i] = 0
-            
+        pd.DataFrame(RESULT).to_csv('/data/wxlou/nonIID/My/result/{}_My_nonIID_CIFAR10_{}_lr{}_batch{}_localstep{}_numdata{}_workers16.csv'.format(start_time,
+                            args.dataset_type,args.lr,args.batch_size,args.local_updates,args.num_data))       # 数据集，数据分布，学习率，batch，τ
 
-            # print("bandwidth ", bandwidth)
-            print("topo\n", topology)    # 这个之前会输出......
-            
-            total_transfer_size = 0
-            for worker in common_config.worker_list:
-                worker_data_size = np.sum(topology[worker.idx]) * ratios[worker.idx] * model_size
-                common_config.recoder.add_scalar('Data Size-'+str(worker.idx), worker_data_size, total_round)
-                total_transfer_size += worker_data_size
-                neighbors_list = list()
-                for neighbor_idx, link in enumerate(topology[worker.idx]):
-                    if link == 1:
-                        neighbors_list.append((neighbor_idx, 1.0 / (np.max([np.sum(topology[worker.idx]), np.sum(topology[neighbor_idx])])+1)))
-                # print(local_steps, neighbors_list, ratios[worker.idx])
-                send_data_socket((local_steps, neighbors_list, ratios[worker.idx]), worker.socket)
-
-                curr_steps += local_steps
-
-            common_config.recoder.add_scalar('Data Size', total_transfer_size, total_round)
-            common_config.recoder.add_scalar('Num of Links', np.sum(topology), total_round)
-            common_config.recoder.add_scalar('Avg Rate', np.average(ratios), total_round)
-            consensus_distance, avg_update_norm, local_prob_list = training_recorder.get_train_info()
-            # server_cos_prob = speed_cos_prob(local_prob_list, topology, server_cos_prob)
-            
-            if curr_steps > test_steps:
-                curr_steps = curr_steps % test_steps
-                break
-
-        # start_time = time.time()
-        # testing signal
-        communication_parallel(common_config.worker_list, action="send", data=(-1, None, None))
-        # print("info parallesim send time {}".format(time.time() - start_time))
-        training_recorder.get_test_info()
     
     # close socket
     for worker in common_config.worker_list:
@@ -242,69 +239,20 @@ class TrainingRecorder(object):
     def get_train_info(self):
         self.round += 1
         communication_parallel(self.worker_list, action="get")
-        avg_train_loss = 0.0
-        round_consensus_distance = np.ones_like(self.moving_consensus_distance) * -1
-        round_update_norm = np.zeros(self.worker_num)
-        # local_para_list = list()
-        local_prob_list = list()
+
+        test_loss = 0.0
+        test_acc = 0.0
+        cos_distance = []
         for worker in self.worker_list:
-            train_loss, neighbors_consensus_distance, local_update_norm, local_cos = worker.train_info[-1]
-            # local_para_list.append(local_para)
-            local_prob_list.append(1-local_cos)
-            for neighbor_idx in neighbors_consensus_distance.keys():
-                round_consensus_distance[worker.idx][neighbor_idx] = neighbors_consensus_distance[neighbor_idx]
-            round_update_norm[worker.idx] = local_update_norm
-            avg_train_loss += train_loss
-        # probablity =  calculate_cosine(local_cos_list)
-        # probablity = 1 - local_cos
-        if self.round == 1:
-            self.avg_update_norm = np.average(round_update_norm)
-        else:
-            self.avg_update_norm = self.beta * self.avg_update_norm + (1 - self.beta) * np.average(round_update_norm)
-        # print("received distance:")
-        # print(round_consensus_distance)
-        # print("update norm", round_update_norm)
-        for worker_idx in range(self.worker_num):
-            for neighbor_idx in range(worker_idx+1, self.worker_num):
-                round_consensus_distance[worker_idx][neighbor_idx] = (round_consensus_distance[worker_idx][neighbor_idx]
-                                                                + round_consensus_distance[neighbor_idx][worker_idx]) / 2
-                round_consensus_distance[neighbor_idx][worker_idx] = round_consensus_distance[worker_idx][neighbor_idx]
-        
-        backup_distance = round_consensus_distance.copy()
-        for k in range(self.worker_num):
-            for worker_idx in range(self.worker_num):
-                for neighbor_idx in range(worker_idx+1, self.worker_num):
-                    if round_consensus_distance[worker_idx][k] >= 0 and round_consensus_distance[neighbor_idx][k] >=0:
-                        tmp = round_consensus_distance[worker_idx][k] + round_consensus_distance[neighbor_idx][k]
-                        if round_consensus_distance[worker_idx][neighbor_idx] < 0:
-                            round_consensus_distance[worker_idx][neighbor_idx] = tmp
-                        else:    
-                            round_consensus_distance[worker_idx][neighbor_idx] = np.min([round_consensus_distance[worker_idx][neighbor_idx], tmp])
-                        round_consensus_distance[neighbor_idx][worker_idx] = round_consensus_distance[worker_idx][neighbor_idx]
-        
-        for worker_idx in range(self.worker_num):
-            round_consensus_distance[worker_idx][worker_idx] = 0
+            loss, cos_dis_vector, acc = worker.train_info[-1]
+            
+            test_loss = test_loss + loss
+            cos_distance.append(cos_dis_vector)
+            test_acc = test_acc + acc
+        test_loss = test_loss/len(self.worker_list)
+        test_acc = test_acc/len(self.worker_list)
 
-        if self.round == 1:
-            self.moving_consensus_distance = round_consensus_distance
-        else:
-            self.moving_consensus_distance = self.beta * self.moving_consensus_distance + (1 - self.beta) * round_consensus_distance
-
-        for worker_idx in range(self.worker_num):
-            for neighbor_idx in range(worker_idx+1, self.worker_num):
-                if backup_distance[worker_idx][neighbor_idx] >= 0:
-                    self.moving_consensus_distance[worker_idx][neighbor_idx] = backup_distance[worker_idx][neighbor_idx]
-                    self.moving_consensus_distance[neighbor_idx][worker_idx] = backup_distance[worker_idx][neighbor_idx]
-        # print("moving distance:")
-        # print(self.moving_consensus_distance)
-
-        avg_train_loss = avg_train_loss / self.worker_num
-        self.recorder.add_scalar('Train_loss/train', avg_train_loss, self.round)
-        self.recorder.add_scalar('Distance', np.average(self.moving_consensus_distance), self.round)
-
-        print("communication round {}, train loss: {}".format(self.round, avg_train_loss))
-
-        return self.moving_consensus_distance, self.avg_update_norm, local_prob_list
+        return test_loss, cos_distance, test_acc
 
     def get_test_info(self):
         self.epoch += 1
@@ -333,201 +281,6 @@ class TrainingRecorder(object):
         print("Epoch: {}, time: {}, average accuracy: {}, average test loss: {}, average train loss: {}".format(self.epoch, self.total_time, avg_acc, avg_test_loss, train_loss))
 
 
-def get_topology_rates(mode, topology, consensus_distance, bandwidth, target_distance,  comp_time, model_size, prob):
-    if mode == "static":
-        if topology == "ring":
-            topology, ratios = ring_topo(prob)
-        elif topology == "ring_4":
-            topology, ratios = ring_topo_4(prob)
-        elif topology == "ring_6":
-            topology, ratios = ring_topo_6(prob)
-        elif topology == "topo_3":
-            topology, ratios = topo_3(prob)
-        elif topology == "topo_6_test":
-            topology, ratios = topo_6_test(prob)
-        elif topology == "ring_test":
-            topology, ratios = ring_test(prob)
-
-    return topology, ratios
-
-def ring_topo(prob, worker_num=6):
-    topology = np.zeros((worker_num, worker_num), dtype=np.int)
-
-    for worker_idx in range(worker_num):
-        topology[worker_idx][worker_idx-1] = 1
-        topology[worker_idx-1][worker_idx] = 1
-    
-    ratios = np.ones(worker_num)
-    return topology, ratios
-
-def ring_topo_6(prob, worker_num=20):
-    topology = np.zeros((worker_num, worker_num), dtype=np.int)
-
-    for worker_idx in range(worker_num):
-        topology[worker_idx][worker_idx-3] = 1
-        topology[worker_idx][worker_idx-6] = 1
-        topology[worker_idx][worker_idx-9] = 1
-
-        topology[worker_idx-3][worker_idx] = 1
-        topology[worker_idx-6][worker_idx] = 1
-        topology[worker_idx-9][worker_idx] = 1
-    
-    ratios = np.ones(worker_num)
-    return topology, ratios
-
-def ring_topo_4(local_prob_list, worker_num=20):
-    topology = np.zeros((worker_num, worker_num), dtype=np.int)
-
-    for worker_idx in range(worker_num):
-        topology[worker_idx][worker_idx-3] = 1
-        topology[worker_idx][worker_idx-6] = 1
-
-        topology[worker_idx-3][worker_idx] = 1
-        topology[worker_idx-6][worker_idx] = 1
-
-    ratios = np.ones(worker_num)
-    return topology, ratios
-
-def speed_cos_prob(local_prob_list, topology, server_cos_prob, worker_num=6):
-    base_topology = np.zeros((worker_num, worker_num), dtype=np.int)
-
-    for worker_idx in range(worker_num):
-        base_topology[worker_idx][worker_idx-3] = 1
-        base_topology[worker_idx][worker_idx-6] = 1
-
-        base_topology[worker_idx-3][worker_idx] = 1
-        base_topology[worker_idx-6][worker_idx] = 1
-
-    for worker_idx in range(worker_num):
-        tmp_idx = 0
-        tmp_neigh_idx = 0
-        for neigh_idx in range(worker_num):
-            if base_topology[worker_idx][neigh_idx] == 1:
-                if topology[worker_idx][neigh_idx] == 1:
-                    server_cos_prob[worker_idx][tmp_neigh_idx] = 0.5 * np.max([0.1, np.random.rand()]) + 0.5 * local_prob_list[worker_idx][tmp_idx]
-                    tmp_idx += 1
-                tmp_neigh_idx += 1
-    
-    print("prob:")
-    print(server_cos_prob)
-    return server_cos_prob
-
-
-def topo_3(prob):
-    topology = [[0, 1, 1, 0, 0, 0, 0, 0, 0, 1],
-                [1, 0, 1, 1, 0, 0, 0, 0, 0, 0],
-                [1, 1, 0, 1, 0, 0, 0, 0, 0, 0],
-                [0, 1, 1, 0, 1, 0, 0, 0, 0, 0],
-                [0, 0, 0, 1, 0, 1, 1, 0, 0, 0],
-                [0, 0, 0, 0, 1, 0, 1, 0, 1, 0],
-                [0, 0, 0, 0, 1, 1, 0, 1, 0, 0],
-                [0, 0, 0, 0, 0, 0, 1, 0, 1, 1],
-                [0, 0, 0, 0, 0, 1, 0, 1, 0, 1],
-                [1, 0, 0, 0, 0, 0, 0, 1, 1, 0]]
-
-    topology = np.array(topology, dtype=np.int)
-    for worker_idx in range(10):
-        for neighbor_idx in range(0, worker_idx):
-            if topology[worker_idx][neighbor_idx] == 1 and np.random.rand() > prob:
-                topology[worker_idx][neighbor_idx] = 0
-                topology[neighbor_idx][worker_idx] = 0
-
-    ratios = np.ones(10)
-    return topology, ratios
-
-def topo_6_test(prob):
-    if prob == 1.0:
-        prob = [[0, 1.0, 1.0, 0.0, 1.0, 1.0],
-                [0, 0.0, 1.0, 0.0, 0.0, 1.0],
-                [0, 0.0, 0.0, 1.0, 1.0, 0.0],
-                [0, 0.0, 0.0, 0.0, 1.0, 0.0],
-                [0, 0.0, 0.0, 0.0, 0.0, 1.0],
-                [0, 0, 0, 0, 0, 0]
-            ]
-    elif prob == 0.5:
-        prob = [[0, 0.5, 0.5, 0.0, 0.5, 0.5],
-                [0, 0.0, 0.5, 0.0, 0.0, 0.5],
-                [0, 0.0, 0.0, 0.5, 0.5, 0.0],
-                [0, 0.0, 0.0, 0.0, 0.5, 0.0],
-                [0, 0.0, 0.0, 0.0, 0.0, 0.5],
-                [0, 0, 0, 0, 0, 0]
-            ]
-    elif prob == 0.1:
-        prob = [[0, 0.1, 1.0, 0.0, 1.0, 1.0],
-                [0, 0.0, 1.0, 0.0, 0.0, 1.0],
-                [0, 0.0, 0.0, 0.1, 1.0, 0.0],
-                [0, 0.0, 0.0, 0.0, 1.0, 0.0],
-                [0, 0.0, 0.0, 0.0, 0.0, 0.1],
-                [0, 0, 0, 0, 0, 0]
-            ]
-    elif prob == 0.0:
-        prob = [[0, 1.0, 0.0, 0.0, 0.0, 1.0],
-                [0, 0.0, 1.0, 0.0, 0.0, 0.0],
-                [0, 0.0, 0.0, 1.0, 0.0, 0.0],
-                [0, 0.0, 0.0, 0.0, 1.0, 0.0],
-                [0, 0.0, 0.0, 0.0, 0.0, 1.0],
-                [0, 0, 0, 0, 0, 0]
-            ]
-
-    prob = np.array(prob)
-    topology = np.zeros((6, 6), dtype=np.int)
-    for worker_idx in range(6):
-        for neighbor_idx in range(worker_idx+1, 6):
-            if np.random.rand() < prob[worker_idx][neighbor_idx]:
-                topology[worker_idx][neighbor_idx] = 1
-                topology[neighbor_idx][worker_idx] = 1
-
-    ratios = np.ones(6)
-    return topology, ratios
-
-def ring_test(prob):
-    if prob == 1:
-        prob_1 = 1.0
-        prob_2 = 1.0
-    elif prob == 2:
-        prob_1 = 0.5
-        prob_2 = 0.5
-    elif prob == 3:
-        prob_1 = 0.25
-        prob_2 = 0.75
-    elif prob == 4:
-        prob_1 = 0.25
-        prob_2 = 1.0
-    elif prob == 5:
-        prob_1 = 0.1
-        prob_2 = 1.0
-    
-    topology = [[0, 1, 1, 0, 0, 0, 0, 0, 1, 1],
-                [1, 0, 1, 1, 0, 0, 0, 0, 0, 1],
-                [1, 1, 0, 1, 1, 0, 0, 0, 0, 0],
-                [0, 1, 1, 0, 1, 1, 0, 0, 0, 0],
-                [0, 0, 1, 1, 0, 1, 1, 0, 0, 0],
-                [0, 0, 0, 1, 1, 0, 1, 1, 0, 0],
-                [0, 0, 0, 0, 1, 1, 0, 1, 1, 0],
-                [0, 0, 0, 0, 0, 1, 1, 0, 1, 1],
-                [1, 0, 0, 0, 0, 0, 1, 1, 0, 1],
-                [1, 1, 0, 0, 0, 0, 0, 1, 1, 0],
-                ]
-    prob = np.zeros((10, 10))
-    for worker_idx in range(10):
-        for neighbor_idx in range(worker_idx+1, 10):
-            if topology[worker_idx][neighbor_idx] == 1:
-                if (worker_idx < 5 and neighbor_idx < 5) or (worker_idx >= 5 and neighbor_idx >= 5):
-                    prob[worker_idx][neighbor_idx] = prob_1
-                else:
-                    prob[worker_idx][neighbor_idx] = prob_2
-    print(prob)
-
-    topology = np.zeros((10, 10), dtype=np.int)
-    for worker_idx in range(10):
-        for neighbor_idx in range(worker_idx+1, 10):
-            if np.random.rand() < prob[worker_idx][neighbor_idx]:
-                topology[worker_idx][neighbor_idx] = 1
-                topology[neighbor_idx][worker_idx] = 1
-
-    ratios = np.ones(10)
-    return topology, ratios
-
 def communication_parallel(worker_list, action, data=None):
     try:
         loop = asyncio.new_event_loop()
@@ -546,126 +299,133 @@ def communication_parallel(worker_list, action, data=None):
     except:
         sys.exit(0)
 
-def non_iid_partition(ratio, worker_num=20):
-    partition_sizes = np.ones((10, worker_num)) * ((1 - ratio) / (worker_num-2))
 
-    for worker_idx in range(10):
-        partition_sizes[worker_idx][worker_idx*2] = ratio / 2
-        partition_sizes[worker_idx][worker_idx*2+1] = ratio / 2
-
-    return partition_sizes
-
-
-def partition_data(dataset_type, data_pattern, worker_num=6):      # 使用6个用户训练，需要添加一个IID
+def partition_data(dataset_type, data_pattern, worker_num=16):      # 使用6个用户训练，需要添加一个IID
     train_dataset, test_dataset = datasets.load_datasets(dataset_type)
 
-    if data_pattern == 11:
-        test_partition_sizes = np.ones((10, 6)) * (1 / 6)           # 划分成2个类，每个用户具有一半的标签
-       
-        partition_sizes = [ [0.33, 0.00, 0.34, 0.00, 0.33, 0.00], 
-                            [0.33, 0.00, 0.34, 0.00, 0.33, 0.00],
-                            [0.33, 0.00, 0.34, 0.00, 0.33, 0.00],
-                            [0.33, 0.00, 0.34, 0.00, 0.33, 0.00],
-                            [0.33, 0.00, 0.34, 0.00, 0.33, 0.00],
-                            [0.00, 0.33, 0.00, 0.34, 0.00, 0.33],
-                            [0.00, 0.33, 0.00, 0.34, 0.00, 0.33],
-                            [0.00, 0.33, 0.00, 0.34, 0.00, 0.33],
-                            [0.00, 0.33, 0.00, 0.34, 0.00, 0.33],
-                            [0.00, 0.33, 0.00, 0.34, 0.00, 0.33],
-                        ]
-        partition_sizes = np.array(partition_sizes)
-    elif data_pattern == 12:
-        test_partition_sizes = np.ones((10, 6)) * (1 / 6)           # 划分成2个类，每个用户具有一半的标签
-        
-        partition_sizes = [ [0.25, 0.08, 0.25, 0.08, 0.25, 0.09], 
-                           [0.25, 0.08, 0.25, 0.08, 0.25, 0.09],
-                           [0.25, 0.08, 0.25, 0.08, 0.25, 0.09],
-                           [0.25, 0.08, 0.25, 0.08, 0.25, 0.09],
-                           [0.25, 0.08, 0.25, 0.08, 0.25, 0.09],
-                            [0.08, 0.25, 0.08, 0.25, 0.09, 0.25],
-                            [0.08, 0.25, 0.08, 0.25, 0.09, 0.25],
-                            [0.08, 0.25, 0.08, 0.25, 0.09, 0.25],
-                            [0.08, 0.25, 0.08, 0.25, 0.09, 0.25],
-                            [0.08, 0.25, 0.08, 0.25, 0.09, 0.25]
-                        ]
-    elif data_pattern == 13:
-        test_partition_sizes = np.ones((10, 6)) * (1 / 6)           # 划分成三个类，每一个类只有3或4个标签
-        
-        partition_sizes = [ [0.40, 0.05, 0.05, 0.40, 0.05, 0.05],
-                            [0.40, 0.05, 0.05, 0.40, 0.05, 0.05],
-                            [0.40, 0.05, 0.05, 0.40, 0.05, 0.05],
-                            [0.05, 0.40, 0.05, 0.05, 0.40, 0.05],
-                            [0.05, 0.40, 0.05, 0.05, 0.40, 0.05],
-                            [0.05, 0.40, 0.05, 0.05, 0.40, 0.05],
-                            [0.05, 0.05, 0.40, 0.05, 0.05, 0.40],
-                            [0.05, 0.05, 0.40, 0.05, 0.05, 0.40],
-                            [0.05, 0.05, 0.40, 0.05, 0.05, 0.40],
-                            [0.05, 0.05, 0.40, 0.05, 0.05, 0.40]
-                        ]
-        partition_sizes = np.array(partition_sizes)
-    elif data_pattern == 14:
-        test_partition_sizes = np.ones((10, 6)) * (1 / 6)           # 划分成三个类，只不过每一个类包含全部标签
-        partition_sizes = [ [0.250, 0.250, 0.125, 0.125, 0.125, 0.125],
-                            [0.250, 0.250, 0.125, 0.125, 0.125, 0.125],
-                            [0.250, 0.250, 0.125, 0.125, 0.125, 0.125],
-                            [0.125, 0.125, 0.250, 0.250, 0.125, 0.125],
-                            [0.125, 0.125, 0.250, 0.250, 0.125, 0.125],
-                            [0.125, 0.125, 0.250, 0.250, 0.125, 0.125],
-                            [0.125, 0.125, 0.125, 0.125, 0.250, 0.250],
-                            [0.125, 0.125, 0.125, 0.125, 0.250, 0.250],
-                            [0.125, 0.125, 0.125, 0.125, 0.250, 0.250],
-                            [0.125, 0.125, 0.125, 0.125, 0.250, 0.250],
-                        ]
-        partition_sizes = np.array(partition_sizes)
-    elif data_pattern == 15:
-        test_partition_sizes = np.ones((10, 6)) * (1 / 6)           # 划分成三个类，只不过每一个类包含全部标签
-        partition_sizes = [ [0.40, 0.40, 0.05, 0.05, 0.05, 0.05],
-                            [0.40, 0.40, 0.05, 0.05, 0.05, 0.05],
-                            [0.40, 0.40, 0.05, 0.05, 0.05, 0.05],
-                            [0.05, 0.05, 0.40, 0.40, 0.05, 0.05],
-                            [0.05, 0.05, 0.40, 0.40, 0.05, 0.05],
-                            [0.05, 0.05, 0.40, 0.40, 0.05, 0.05],
-                            [0.05, 0.05, 0.05, 0.05, 0.40, 0.40],
-                            [0.05, 0.05, 0.05, 0.05, 0.40, 0.40],
-                            [0.05, 0.05, 0.05, 0.05, 0.40, 0.40],
-                            [0.05, 0.05, 0.05, 0.05, 0.40, 0.40]
-                        ]
-        partition_sizes = [ [0.40, 0.05, 0.05, 0.40, 0.05, 0.05],
-                            [0.40, 0.05, 0.05, 0.40, 0.05, 0.05],
-                            [0.40, 0.05, 0.05, 0.40, 0.05, 0.05],
-                            [0.05, 0.40, 0.05, 0.05, 0.40, 0.05],
-                            [0.05, 0.40, 0.05, 0.05, 0.40, 0.05],
-                            [0.05, 0.40, 0.05, 0.05, 0.40, 0.05],
-                            [0.05, 0.05, 0.40, 0.05, 0.05, 0.40],
-                            [0.05, 0.05, 0.40, 0.05, 0.05, 0.40],
-                            [0.05, 0.05, 0.40, 0.05, 0.05, 0.40],
-                            [0.05, 0.05, 0.40, 0.05, 0.05, 0.40]
-                        ]
-        partition_sizes = np.array(partition_sizes)
-    
-    elif data_pattern == 16:
-        test_partition_sizes = np.ones((10, 6)) * (1 / 6)   
-        def non_iid_partition_cifar10(ratio, worker_num=6):
-            partition_sizes = np.ones((10, worker_num)) * ((1 - ratio) / (worker_num-1))
+    # partition_sizes = np.ones((100, worker_num)) * (1.0 / worker_num)
+    partition_sizes = non_IID(worker_num)
+    test_partition_sizes= np.ones((10, worker_num)) * (1.0 / worker_num)
+    print(test_partition_sizes)
 
-            for worker_idx in range(worker_num):
-                partition_sizes[worker_idx][worker_idx] = ratio
-            
-            partition_sizes[-1] = np.ones(worker_num) * (1 / worker_num)
-
-            return partition_sizes
-        partition_sizes = non_iid_partition_cifar10(0.4,6)
-        # print(partition_sizes)
-    else:                                                               # IID 分布
-        test_partition_sizes = np.ones((10, 6)) * (1 / 6)  
-        partition_sizes = np.ones((10, 6)) * (1 / 6)  
-    print(partition_sizes)
-    
     train_data_partition = datasets.LabelwisePartitioner(train_dataset, partition_sizes=partition_sizes)
-    # test_data_partition = datasets.LabelwisePartitioner(test_dataset, partition_sizes=partition_sizes)           
-    test_data_partition = datasets.LabelwisePartitioner(test_dataset, partition_sizes=test_partition_sizes)     
-    
+    test_data_partition = datasets.LabelwisePartitioner(test_dataset,partition_sizes=test_partition_sizes)
     return train_data_partition, test_data_partition
+    
+def non_IID(worker_num,dataset_type="CIFAR10"):
+    if worker_num==16:
+        data = [[0.2] * 4 + [0.01666] * 12,
+                [0.2] * 4 + [0.01666] * 12,
+                [0.01666] * 4 + [0.2] * 4 + [0.01666] * 8,
+                [0.01666] * 4 + [0.2] * 4 + [0.01666] * 8,
+                [0.01666] * 8 + [0.2] * 4 + [0.01666] * 4,
+                [0.01666] * 8 + [0.2] * 4 + [0.01666] * 4,
+                [0.01666] * 12 + [0.2] * 4,
+                [0.01666] * 12 + [0.2] * 4,
+                [0.0625] * 16,
+                [0.0625] * 16]
+    elif worker_num==12:
+        data = [[0.332] * 3 + [0.0] * 9,
+                [0.332] * 3 + [0.0] * 9,
+                [0.0] * 3 + [0.332] * 3 + [0] * 6,
+                [0.0] * 3 + [0.332] * 3 + [0] * 6,
+                [0.0] * 6 + [0.332] * 3 + [0] * 3,
+                [0.0] * 6 + [0.332] * 3 + [0] * 3,
+                [0.0] * 9 + [0.332] * 3,
+                [0.0] * 9 + [0.332] * 3,
+                [0.083] * 12,
+                [0.083] * 12]
+
+    else:
+        data = [[0.296] * 3 + [0.0186] * 6,
+                [0.296] * 3 + [0.0186] * 6,
+                [0.296] * 3 + [0.0186] * 6,
+                [0.0186] * 3 + [0.296] * 3 + [0.0186] * 3,
+                [0.0186] * 3 + [0.296] * 3 + [0.0186] * 3,
+                [0.0186] * 3 + [0.296] * 3 + [0.0186] * 3,
+                [0.0186] * 3 + [0.296] * 6,
+                [0.0186] * 3 + [0.296] * 6,
+                [0.0186] * 3 + [0.296] * 6,
+                [0.111] * 9]
+    return data
+
+def get_topology(worker_num=16):
+    topology = np.zeros((worker_num, worker_num), dtype=np.int)
+    for worker_idx in range(worker_num):
+        topology[worker_idx][worker_idx-1] = 1
+        topology[worker_idx-1][worker_idx] = 1
+    
+    if worker_num==16:
+        topology2 = [[0, 1, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0],
+                     [1, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0],
+                     [0, 1, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0],
+                     [1, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1],
+
+                     [1, 0, 0, 0, 0, 1, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0],
+                     [0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0],
+                     [0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0],
+                     [0, 0, 0, 1, 1, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0],
+
+                     [0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 1, 1, 0, 0, 0],
+                     [0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0, 0],
+                     [0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0],
+                     [0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 1, 0, 0, 0, 0, 1],
+
+                     [1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 1],
+                     [0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 1, 0],
+                     [0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 1],
+                     [0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 1, 0]]
+    elif worker_num==12:
+        topology2 = [[0, 1, 0, 1, 1, 0, 0, 0, 1, 0, 0, 0],
+                     [1, 0, 1, 0, 0, 1, 0, 0, 0, 1, 0, 0],
+                     [0, 1, 0, 1, 0, 0, 1, 0, 0, 0, 1, 0],
+                     [1, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 1],
+
+                     [1, 0, 0, 0, 0, 1, 0, 1, 1, 0, 0, 0],
+                     [0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0, 0],
+                     [0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0],
+                     [0, 0, 0, 1, 1, 0, 1, 0, 0, 0, 0, 1],
+
+                     [1, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 1],
+                     [0, 1, 0, 0, 0, 1, 0, 0, 1, 0, 1, 0],
+                     [0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 0, 1],
+                     [0, 0, 0, 1, 0, 0, 0, 1, 1, 0, 1, 0]]
+    else:
+        topology2 = [
+            [0, 1, 1, 1, 0, 0, 1, 0, 0],
+            [1, 0, 1, 0, 1, 0, 0, 1, 0],
+            [1, 1, 0, 0, 0, 1, 0, 0, 1],
+
+            [1, 0, 0, 0, 1, 1, 1, 0, 0],
+            [0, 1, 0, 1, 0, 1, 0, 1, 0],
+            [0, 0, 1, 1, 1, 0, 0, 0, 1],
+
+            [1, 0, 0, 1, 0, 0, 0, 1, 1],
+            [0, 1, 0, 0, 1, 0, 1, 0, 1],
+            [0, 0, 1, 0, 0, 1, 1, 1, 0]
+        ]
+
+    return topology2
+
+def update_topo(topology_prob,train_num_topo,cos_dis_vector):
+    train_num = copy.deepcopy(train_num_topo)
+    topology = copy.deepcopy(topology_prob)
+    for i in range(len(topology_prob)):
+        for j in range(i,len(topology_prob)):
+            if cos_dis_vector[i][j] == 0:
+                continue
+            else:
+                prob = math.exp(-1.0 * args.xigema * (cos_dis_vector[i][j]+cos_dis_vector[j][i])/2.0)
+                mid_prob = train_num_topo[i][j]*topology_prob[i][j] + prob
+                topology[j][i] = mid_prob / (1.0*train_num_topo[i][j]+1.0)
+                topology[i][j] = mid_prob / (1.0*train_num_topo[i][j]+1.0)
+                train_num[i][j] = train_num[j][i] = train_num_topo[i][j] + 1
+    return topology,train_num
+
+
+def get_connected_graph(topology,topology_prob):
+    pass
+
 
 if __name__ == "__main__":
     main()
