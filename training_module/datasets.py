@@ -90,7 +90,7 @@ class LabelwisePartitioner(object):
     def __len__(self):
         return len(self.data)
 
-def create_dataloaders(dataset, batch_size, selected_idxs=None, shuffle=True, pin_memory=True, num_workers=4):
+def create_dataloaders(dataset, batch_size, selected_idxs=None, shuffle=True, pin_memory=True, num_workers=0):
     if selected_idxs == None:
         dataloader = DataLoader(dataset, batch_size=batch_size,
                                     shuffle=shuffle, pin_memory=pin_memory, num_workers=num_workers)
@@ -101,7 +101,7 @@ def create_dataloaders(dataset, batch_size, selected_idxs=None, shuffle=True, pi
     
     return DataLoaderHelper(dataloader)
 
-def load_datasets(dataset_type, data_path="/home/wxlou/p2p/D-PSGD/data"):
+def load_datasets(dataset_type, data_path="/data/wxlou/dataset"):
     
     train_transform = load_default_transform(dataset_type, train=True)
     test_transform = load_default_transform(dataset_type, train=False)
@@ -137,6 +137,7 @@ def load_default_transform(dataset_type, train=False):
                             ])
 
     elif dataset_type == 'CIFAR100':
+        # reference:https://github.com/weiaicunzai/pytorch-cifar100/blob/master/utils.py
         normalize = transforms.Normalize((0.5070751592371323, 0.48654887331495095, 0.4409178433670343), 
                                                     (0.2673342858792401, 0.2564384629170883, 0.27615047132568404))
         if train:
