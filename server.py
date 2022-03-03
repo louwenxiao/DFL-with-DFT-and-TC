@@ -44,9 +44,6 @@ parser.add_argument('--xigema', type=int, default=0)
 
 args = parser.parse_args()
 
-# os.environ['CUDA_VISIBLE_DEVICES'] = '0'
-# pid_name = "FedGKT"
-# setproctitle.setproctitle(pid_name)
 SERVER_IP = "127.0.0.1"
 RESULT = [[0],[0],[0],[4]]      # 分别用来保存：带宽MB，时间s，精度，损失
 model_size = 0.1 + 2.0 * args.num_data
@@ -137,20 +134,11 @@ def main():
     
     # partition dataset
     train_data_partition, test_data_partition = partition_data(common_config.dataset_type, args.data_pattern,worker_num=worker_num)
-    if worker_num == 16:
-        data_para = [0, 6, 10, 12, 1, 7, 11, 13, 2, 4, 8, 14, 3, 5, 9, 15]
-    elif worker_num == 12:
-        data_para = [0, 6, 8, 1, 7, 9, 2, 4, 10, 3, 5, 11]
-    elif worker_num == 9:
-        data_para = [0, 4, 8, 1, 5, 6, 2, 3, 7]
-    else:
-        data_para = [0,1,2,3]
-        
+ 
     for worker_idx, worker in enumerate(common_config.worker_list):
         worker.config.para = None
-        p = data_para.index(worker_idx)
-        worker.config.custom["train_data_idxes"] = train_data_partition.use(p)
-        worker.config.custom["test_data_idxes"] = test_data_partition.use(p)
+        worker.config.custom["train_data_idxes"] = train_data_partition.use(worker_idx)
+        worker.config.custom["test_data_idxes"] = test_data_partition.use(worker_idx)
 
     # connect socket and send init config
     communication_parallel(common_config.worker_list, action="init")
@@ -213,7 +201,7 @@ def main():
         RESULT[3].append(test_loss)
 
         pd.DataFrame(RESULT).to_csv('/data/wxlou/nonIID/My/result/{}_My_nonIID_CIFAR10_{}_lr{}_batch{}_localstep{}_numdata{}_workers16.csv'.format(start_time,
-                            args.dataset_type,args.lr,args.batch_size,args.local_updates,args.num_data))       # 数据集，数据分布，学习率，batch，τ
+                            args.dataset_type,args.lr,args.batch_size,args.local_updates,args.num_data))      
 
     
     # close socket
@@ -304,7 +292,7 @@ def partition_data(dataset_type, data_pattern, worker_num=16):      # 使用6个
     train_dataset, test_dataset = datasets.load_datasets(dataset_type)
 
     # partition_sizes = np.ones((100, worker_num)) * (1.0 / worker_num)
-    partition_sizes = non_IID(worker_num)
+    partition_sizes = non_iid_partition(data_pattern,worker_num=worker_num)
     test_partition_sizes= np.ones((10, worker_num)) * (1.0 / worker_num)
     print(test_partition_sizes)
 
@@ -312,100 +300,20 @@ def partition_data(dataset_type, data_pattern, worker_num=16):      # 使用6个
     test_data_partition = datasets.LabelwisePartitioner(test_dataset,partition_sizes=test_partition_sizes)
     return train_data_partition, test_data_partition
     
-def non_IID(worker_num,dataset_type="CIFAR10"):
-    if worker_num==16:
-        data = [[0.2] * 4 + [0.01666] * 12,
-                [0.2] * 4 + [0.01666] * 12,
-                [0.01666] * 4 + [0.2] * 4 + [0.01666] * 8,
-                [0.01666] * 4 + [0.2] * 4 + [0.01666] * 8,
-                [0.01666] * 8 + [0.2] * 4 + [0.01666] * 4,
-                [0.01666] * 8 + [0.2] * 4 + [0.01666] * 4,
-                [0.01666] * 12 + [0.2] * 4,
-                [0.01666] * 12 + [0.2] * 4,
-                [0.0625] * 16,
-                [0.0625] * 16]
-    elif worker_num==12:
-        data = [[0.332] * 3 + [0.0] * 9,
-                [0.332] * 3 + [0.0] * 9,
-                [0.0] * 3 + [0.332] * 3 + [0] * 6,
-                [0.0] * 3 + [0.332] * 3 + [0] * 6,
-                [0.0] * 6 + [0.332] * 3 + [0] * 3,
-                [0.0] * 6 + [0.332] * 3 + [0] * 3,
-                [0.0] * 9 + [0.332] * 3,
-                [0.0] * 9 + [0.332] * 3,
-                [0.083] * 12,
-                [0.083] * 12]
 
-    else:
-        data = [[0.296] * 3 + [0.0186] * 6,
-                [0.296] * 3 + [0.0186] * 6,
-                [0.296] * 3 + [0.0186] * 6,
-                [0.0186] * 3 + [0.296] * 3 + [0.0186] * 3,
-                [0.0186] * 3 + [0.296] * 3 + [0.0186] * 3,
-                [0.0186] * 3 + [0.296] * 3 + [0.0186] * 3,
-                [0.0186] * 3 + [0.296] * 6,
-                [0.0186] * 3 + [0.296] * 6,
-                [0.0186] * 3 + [0.296] * 6,
-                [0.111] * 9]
-    return data
+def non_iid_partition(ratio, worker_num=16):
+    partition_sizes = np.ones((10, worker_num)) * ((1 - ratio) / (worker_num-2))
+    for worker_idx in range(8):
+        partition_sizes[worker_idx][worker_idx*2] = ratio / 2
+        partition_sizes[worker_idx][worker_idx*2+1] = ratio / 2
+    return partition_sizes
 
 def get_topology(worker_num=16):
-    topology = np.zeros((worker_num, worker_num), dtype=np.int)
+    topology = np.ones((worker_num, worker_num), dtype=np.int)
     for worker_idx in range(worker_num):
-        topology[worker_idx][worker_idx-1] = 1
-        topology[worker_idx-1][worker_idx] = 1
-    
-    if worker_num==16:
-        topology2 = [[0, 1, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0],
-                     [1, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0],
-                     [0, 1, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0],
-                     [1, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1],
-
-                     [1, 0, 0, 0, 0, 1, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0],
-                     [0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0],
-                     [0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0],
-                     [0, 0, 0, 1, 1, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-
-                     [0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 1, 1, 0, 0, 0],
-                     [0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0, 0],
-                     [0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0],
-                     [0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 1, 0, 0, 0, 0, 1],
-
-                     [1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 1],
-                     [0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 1, 0],
-                     [0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 1],
-                     [0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 1, 0]]
-    elif worker_num==12:
-        topology2 = [[0, 1, 0, 1, 1, 0, 0, 0, 1, 0, 0, 0],
-                     [1, 0, 1, 0, 0, 1, 0, 0, 0, 1, 0, 0],
-                     [0, 1, 0, 1, 0, 0, 1, 0, 0, 0, 1, 0],
-                     [1, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 1],
-
-                     [1, 0, 0, 0, 0, 1, 0, 1, 1, 0, 0, 0],
-                     [0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0, 0],
-                     [0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0],
-                     [0, 0, 0, 1, 1, 0, 1, 0, 0, 0, 0, 1],
-
-                     [1, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 1],
-                     [0, 1, 0, 0, 0, 1, 0, 0, 1, 0, 1, 0],
-                     [0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 0, 1],
-                     [0, 0, 0, 1, 0, 0, 0, 1, 1, 0, 1, 0]]
-    else:
-        topology2 = [
-            [0, 1, 1, 1, 0, 0, 1, 0, 0],
-            [1, 0, 1, 0, 1, 0, 0, 1, 0],
-            [1, 1, 0, 0, 0, 1, 0, 0, 1],
-
-            [1, 0, 0, 0, 1, 1, 1, 0, 0],
-            [0, 1, 0, 1, 0, 1, 0, 1, 0],
-            [0, 0, 1, 1, 1, 0, 0, 0, 1],
-
-            [1, 0, 0, 1, 0, 0, 0, 1, 1],
-            [0, 1, 0, 0, 1, 0, 1, 0, 1],
-            [0, 0, 1, 0, 0, 1, 1, 1, 0]
-        ]
-
-    return topology2
+        topology[worker_idx][worker_idx] = 0
+        
+    return topology
 
 def update_topo(topology_prob,train_num_topo,cos_dis_vector):
     train_num = copy.deepcopy(train_num_topo)
